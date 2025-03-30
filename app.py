@@ -41,7 +41,7 @@ Provide a factual answer to this questions using only the above provided context
 
 Do not give an opinion or remarks. Do not make introductions or conclusions. Do not make explanations or summaries. Do not make assumptions. Do not say that you are answering from a provided context.
 
-Use one to three sentences maximum (it can be way less). Be direct in your answer and do not repeat yourself. Keep the answer short, concice and accurate to the provided context with the highest fidelity.
+Use one to three sentences maximum (it can be way less). Be direct in your answer and do not repeat yourself. Don't use enumerations. Keep the answer short, concice and accurate to the provided context with the highest fidelity.
 
 If the question is irrelevant to your role as a well-being coach, just answer : "It's not my role to answer this question".
 If the question is relevant to your role but don't find the answer in the context or if you have a doubt, don't give explnations, only say :"I can't give give you an accurate answer to this question yet".
@@ -224,7 +224,7 @@ def add_to_vector_collection(all_splits: list[Document], file_name: str):
     st.success("Data added to the vector store!")
 
 
-def query_collection(prompt: str, n_results: int = 10):
+def query_collection(prompt: str, n_results: int = 20):
     """Queries the vector collection with a given prompt to retrieve relevant documents.
 
     Args:
@@ -359,7 +359,7 @@ def re_rank_cross_encoders(documents: list[str], show_thinking: bool = False) ->
     relevant_text_ids = []
 
     encoder_model = CrossEncoder("BAAI/bge-reranker-v2-m3")
-    ranks = encoder_model.rank(prompt, documents, top_k=3)
+    ranks = encoder_model.rank(prompt, documents, top_k=10)
     
     # Afficher les détails du reranking uniquement si show_thinking est activé
     if show_thinking:
