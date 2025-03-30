@@ -25,7 +25,7 @@ from streamlit.runtime.uploaded_file_manager import UploadedFile
 from kokoro import KPipeline
 import soundfile as sf
 
-system_prompt = """You are an well-being coach expert in question-answering tasks with a human-likedirect style. 
+system_prompt = """You are an well-being coach expert in conversation with a human-like direct style. 
 
 Here is the provided context to use to answer the question:
 
@@ -33,15 +33,21 @@ Here is the provided context to use to answer the question:
 
 Think carefully about the above context. 
 
-Now, review the user question:
+Now, review the conversation history and the user's latest question:
 
+Conversation History:
+{conversation_history}
+
+Latest Question:
 {question}
 
-Provide a factual answer to this questions using only the above provided context. Do not include any external knowledge or references or assumptions not present in the given context. 
+Provide a factual answer to this questions using only the above provided context and conversation history. Do not include any external knowledge or references or assumptions not present in the given context. 
 
 Do not give an opinion or remarks. Do not make introductions or conclusions. Do not make explanations or summaries. Do not make assumptions. Do not say that you are answering from a provided context.
 
 Use one to three sentences maximum (it can be way less). Be direct in your answer and do not repeat yourself. Don't use enumerations. Keep the answer short, concice and accurate to the provided context with the highest fidelity.
+
+Make sure your answers are consistent with your previous answers in the conversation history.
 
 If the question is irrelevant to your role as a well-being coach, just answer : "It's not my role to answer this question".
 If the question is relevant to your role but don't find the answer in the context or if you have a doubt, don't give explnations, only say :"I can't give give you an accurate answer to this question yet".
@@ -49,6 +55,9 @@ If any question is about you or refering to your behavior, just answer that you 
 
 Answer:"""
 
+# Initialisation de l'historique de conversation dans session_state
+if 'conversation_history' not in st.session_state:
+    st.session_state.conversation_history = []
 
 def get_redis_store() -> RedisVectorStore:
     """Gets or creates a Redis vector store for caching embeddings.
@@ -242,8 +251,27 @@ def query_collection(prompt: str, n_results: int = 20):
     return results
 
 
-def call_llm(context: str, prompt: str, show_thinking: bool = False, timer_placeholder=None):
-    """Calls the language model with context and prompt to generate a response.
+def format_conversation_history(history):
+    """Formate l'historique de conversation pour l'inclure dans le prompt.
+    
+    Args:
+        history: Liste de tuples (question, réponse)
+        
+    Returns:
+        str: Historique formaté pour le prompt
+    """
+    if not history:
+        return ""
+    
+    formatted_history = ""
+    for i, (question, answer) in enumerate(history):
+        formatted_history += f"User: {question}\nAssistant: {answer}\n\n"
+    
+    return formatted_history
+
+
+def call_llm(context: str, prompt: str, conversation_history=None, show_thinking: bool = False, timer_placeholder=None):
+    """Calls the language model with context, conversation history and prompt to generate a response.
 
     Uses Ollama to stream responses from a language model by providing context and a
     question prompt. The model uses a system prompt to format and ground its responses appropriately.
@@ -251,6 +279,7 @@ def call_llm(context: str, prompt: str, show_thinking: bool = False, timer_place
     Args:
         context: String containing the relevant context for answering the question
         prompt: String containing the user's question
+        conversation_history: List of previous conversation turns
         show_thinking: Boolean indicating whether to show the model's thinking process
         timer_placeholder: Placeholder Streamlit pour afficher le chronomètre
 
@@ -263,17 +292,20 @@ def call_llm(context: str, prompt: str, show_thinking: bool = False, timer_place
     # Marquer le début de la génération
     start_time = time.time()
     
+    # Formater l'historique de conversation
+    formatted_history = format_conversation_history(conversation_history) if conversation_history else ""
+    
     response = ollama.chat(
         model="deepseek-r1:8b-llama-distill-q4_K_M",
         stream=True,
         messages=[
             {
                 "role": "system",
-                "content": system_prompt,
+                "content": system_prompt.format(context=context, conversation_history=formatted_history, question=prompt),
             },
             {
                 "role": "user",
-                "content": f"Context: {context}, Question: {prompt}",
+                "content": prompt,
             },
         ],
     )
@@ -449,9 +481,29 @@ if __name__ == "__main__":
     if 'total_time' not in st.session_state:
         st.session_state.total_time = 0
     
+    # Initialiser l'historique de conversation s'il n'existe pas
+    if 'conversation_history' not in st.session_state:
+        st.session_state.conversation_history = []
+    
+    # Initialiser les variables pour conserver les données entre les recharges
+    if 'last_thinking_data' not in st.session_state:
+        st.session_state.last_thinking_data = None
+    if 'last_relevant_ids' not in st.session_state:
+        st.session_state.last_relevant_ids = None
+    if 'last_relevant_text' not in st.session_state:
+        st.session_state.last_relevant_text = None
+    if 'last_results' not in st.session_state:
+        st.session_state.last_results = None
+    if 'last_audio_data' not in st.session_state:
+        st.session_state.last_audio_data = None
+    if 'submit_clicked' not in st.session_state:
+        st.session_state.submit_clicked = False
+    if 'input_key' not in st.session_state:
+        st.session_state.input_key = 0
+    
     # Document Upload Area
     with st.sidebar:
-        st.set_page_config(page_title="RAG Question Answer")
+        st.set_page_config(page_title="Coach Conversationnel RAG")
         uploaded_file = st.file_uploader(
             "**📑 Upload PDF files for QnA**",
             type=["pdf", "csv"],
@@ -485,15 +537,48 @@ if __name__ == "__main__":
             else:
                 all_splits = process_document(uploaded_file)
                 add_to_vector_collection(all_splits, normalize_uploaded_file_name)
+        
+        # Bouton pour réinitialiser la conversation
+        if st.button("🔄 Nouvelle conversation"):
+            st.session_state.conversation_history = []
+            st.session_state.last_thinking_data = None
+            st.session_state.last_relevant_ids = None
+            st.session_state.last_relevant_text = None
+            st.session_state.last_results = None
+            st.session_state.last_audio_data = None
+            st.session_state.submit_clicked = False
+            # Incrémenter pour forcer le rechargement du widget
+            st.session_state.input_key += 1
+            st.rerun()
 
     # Question and Answer Area
-    st.header("🗣️ RAG Question Answer")
-    prompt = st.text_area("**Ask a question related to your document:**")
+    st.header("🗣️ Conversation avec votre Coach")
+    
+    # Afficher l'historique de conversation
+    conversation_container = st.container()
+    with conversation_container:
+        for i, (question, answer) in enumerate(st.session_state.conversation_history):
+            st.markdown(f"**Vous**: {question}")
+            st.markdown(f"**Coach**: {answer}")
+            st.divider()
+    
+    # Fonction pour gérer la soumission et vider l'entrée après traitement
+    def handle_submit():
+        st.session_state.submit_clicked = True
+        # Stocker temporairement le contenu de l'entrée utilisateur
+        if "temp_input" not in st.session_state:
+            st.session_state.temp_input = st.session_state.get(f"question_input_{st.session_state.input_key}", "")
+        # Incrémenter la clé pour forcer la recréation du widget avec une valeur vide
+        st.session_state.input_key += 1
+    
+    # Zone de texte pour la nouvelle question avec une clé dynamique
+    prompt_key = f"question_input_{st.session_state.input_key}"
+    prompt = st.text_area("**Posez une question à votre coach:**", key=prompt_key)
     
     # Nouvelle interface avec bouton plus petit et zone pour le chronomètre et TTS
     cols = st.columns([2, 1, 1, 1])
     with cols[0]:
-        ask = st.button("🔥 Ask", use_container_width=False)
+        ask = st.button("🔥 Envoyer", use_container_width=False, on_click=handle_submit)
     with cols[1]:
         show_thinking = st.checkbox("💭 Afficher la réflexion", value=False, 
                                   help="Montre ou cache le processus de réflexion du modèle (balises <think>)", 
@@ -508,12 +593,26 @@ if __name__ == "__main__":
             st.metric("⏱️", f"{st.session_state.total_time:.1f}s")
         else:
             st.empty()
-
-    if ask and prompt:
+    
+    # Afficher l'audio de la dernière réponse s'il existe
+    if st.session_state.last_audio_data is not None and enable_tts:
+        st.markdown(create_audio_player_html(st.session_state.last_audio_data), unsafe_allow_html=True)
+    
+    # Déplacement des expanders après cette section pour les afficher après le traitement
+    
+    # Utiliser la valeur temporairement stockée si le bouton a été cliqué
+    user_input = ""
+    if st.session_state.submit_clicked and "temp_input" in st.session_state:
+        user_input = st.session_state.temp_input
+        # Réinitialiser pour la prochaine utilisation
+        del st.session_state.temp_input
+        st.session_state.submit_clicked = False
+    
+    if user_input:
         # Réinitialiser le temps total
         st.session_state.total_time = 0
         
-        # Container pour le chronomètre en temps réel - utiliser text au lieu de metric
+        # Container pour le chronomètre en temps réel
         timer_container = st.empty()
         timer_container.markdown("⏱️ **0.0s**")
         
@@ -527,18 +626,25 @@ if __name__ == "__main__":
         # Première mise à jour
         update_timer()
         
-        cached_results = query_semantic_cache(query=prompt)
+        # Afficher la question de l'utilisateur immédiatement
+        st.markdown(f"**Vous**: {user_input}")
+        
+        cached_results = query_semantic_cache(query=user_input)
 
         if cached_results:
             # Afficher les résultats du cache
             response_text = cached_results[0][0].metadata["answer"].replace("\\n", "\n")
-            st.write(response_text)
+            st.markdown(f"**Coach**: {response_text}")
+            
+            # Ajouter à l'historique de conversation
+            st.session_state.conversation_history.append((user_input, response_text))
             
             # Générer et afficher l'audio si activé
             if enable_tts:
                 audio_bytes = text_to_speech(response_text)
                 if audio_bytes:
                     st.markdown(create_audio_player_html(audio_bytes), unsafe_allow_html=True)
+                    st.session_state.last_audio_data = audio_bytes
             
             # Mise à jour finale du chrono pour les résultats du cache
             total_time = time.time() - start_time
@@ -547,7 +653,9 @@ if __name__ == "__main__":
         else:
             # Mettre à jour le chronomètre avant chaque étape
             update_timer()
-            results = query_collection(prompt=prompt)
+            results = query_collection(prompt=user_input)
+            # Sauvegarder pour l'affichage ultérieur
+            st.session_state.last_results = results
             
             # Mettre à jour à nouveau
             update_timer()
@@ -561,130 +669,195 @@ if __name__ == "__main__":
             # Mettre à jour à nouveau
             update_timer()
             
+            # Collecter les données de réflexion si show_thinking est activé
+            thinking_data = []
+            
             # Passer le paramètre show_thinking à la fonction re_rank_cross_encoders
-            relevant_text, relevant_text_ids = re_rank_cross_encoders(context, show_thinking=show_thinking)
+            relevant_text, relevant_text_ids = re_rank_cross_encoders(context, show_thinking=False)
+            
+            # Sauvegarder pour l'affichage ultérieur
+            st.session_state.last_relevant_text = relevant_text
+            st.session_state.last_relevant_ids = relevant_text_ids
             
             # Mettre à jour à nouveau
             update_timer()
             
-            # Appeler le modèle et afficher la réponse
-            response_container = st.container()
-            with response_container:
-                # Placeholder pour la réponse
-                response_placeholder = st.empty()
+            # Préparation de la réponse du coach
+            st.markdown("**Coach**: ")
+            
+            # Placeholder pour la réponse
+            response_placeholder = st.empty()
+            
+            # Container pour l'audio
+            audio_placeholder = st.empty()
+            
+            # Générer et afficher la réponse
+            response_text = ""
+            
+            # Pour collecter le thinking process
+            thinking_process = ""
+            
+            # Utiliser directement ollama.chat pour plus de contrôle
+            response = ollama.chat(
+                model="deepseek-r1:8b-llama-distill-q4_K_M",
+                stream=True,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": system_prompt.format(
+                            context=relevant_text, 
+                            conversation_history=format_conversation_history(st.session_state.conversation_history),
+                            question=user_input
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": user_input,
+                    },
+                ],
+            )
+            
+            # Pour le traitement des balises <think>
+            buffer = ""
+            in_think_block = False
+            
+            # Pour stocker le texte filtré pour TTS (sans balises think)
+            filtered_text_for_tts = ""
+            
+            for chunk in response:
+                # Mettre à jour le chrono à chaque chunk
+                update_timer()
                 
-                # Container pour l'audio
-                audio_placeholder = st.empty()
-                
-                # Générer et afficher la réponse
-                response_text = ""
-                
-                # Utiliser directement ollama.chat pour plus de contrôle
-                response = ollama.chat(
-                    model="deepseek-r1:8b-llama-distill-q4_K_M",
-                    stream=True,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": system_prompt,
-                        },
-                        {
-                            "role": "user",
-                            "content": f"Context: {relevant_text}, Question: {prompt}",
-                        },
-                    ],
-                )
-                
-                # Pour le traitement des balises <think>
-                buffer = ""
-                in_think_block = False
-                
-                # Pour stocker le texte filtré pour TTS (sans balises think)
-                filtered_text_for_tts = ""
-                
-                for chunk in response:
-                    # Mettre à jour le chrono à chaque chunk
-                    update_timer()
+                if chunk["done"] is False:
+                    content = chunk["message"]["content"]
+                    buffer += content
                     
-                    if chunk["done"] is False:
-                        content = chunk["message"]["content"]
-                        buffer += content
-                        
-                        if not show_thinking:
-                            # Traiter le contenu pour filtrer les blocs <think>...</think>
-                            while "<think>" in buffer or "</think>" in buffer:
-                                # Si on trouve une balise d'ouverture
-                                if "<think>" in buffer and not in_think_block:
-                                    # Extraire le contenu avant la balise et l'envoyer
-                                    parts = buffer.split("<think>", 1)
-                                    if parts[0]:
-                                        response_text += parts[0]
-                                        filtered_text_for_tts += parts[0]  # Ajouter au texte filtré
-                                        response_placeholder.markdown(response_text)
-                                    buffer = parts[1]
-                                    in_think_block = True
-                                
-                                # Si on trouve une balise de fermeture
-                                elif "</think>" in buffer and in_think_block:
-                                    # Extraire le contenu après la balise et continuer
-                                    parts = buffer.split("</think>", 1)
-                                    buffer = parts[1] if len(parts) > 1 else ""
-                                    in_think_block = False
-                                
-                                # Si pas de balise ou traitement incomplet, sortir de la boucle
-                                else:
-                                    break
+                    if not show_thinking:
+                        # Traiter le contenu pour filtrer les blocs <think>...</think>
+                        while "<think>" in buffer or "</think>" in buffer:
+                            # Si on trouve une balise d'ouverture
+                            if "<think>" in buffer and not in_think_block:
+                                # Extraire le contenu avant la balise et l'envoyer
+                                parts = buffer.split("<think>", 1)
+                                if parts[0]:
+                                    response_text += parts[0]
+                                    filtered_text_for_tts += parts[0]  # Ajouter au texte filtré
+                                    response_placeholder.markdown(response_text)
+                                buffer = parts[1]
+                                in_think_block = True
+                                # Collecter pour le thinking process
+                                thinking_process += "<think>"
                             
-                            # Envoyer le contenu accumulé s'il n'est pas dans un bloc think
-                            if not in_think_block and buffer and "<think>" not in buffer:
-                                response_text += buffer
-                                filtered_text_for_tts += buffer  # Ajouter au texte filtré
-                                response_placeholder.markdown(response_text)
-                                buffer = ""
-                        else:
-                            # Si l'affichage du processus de réflexion est activé, envoyer tel quel
-                            response_text += content
-                            # Mais ne pas ajouter les blocs think au texte pour TTS
-                            if "<think>" not in content and "</think>" not in content and not in_think_block:
-                                filtered_text_for_tts += content
-                            elif "<think>" in content:
+                            # Si on trouve une balise de fermeture
+                            elif "</think>" in buffer and in_think_block:
+                                # Extraire le contenu après la balise et continuer
+                                parts = buffer.split("</think>", 1)
+                                # Collecter pour le thinking process
+                                thinking_process += parts[0] + "</think>"
+                                buffer = parts[1] if len(parts) > 1 else ""
+                                in_think_block = False
+                            
+                            # Si pas de balise ou traitement incomplet, sortir de la boucle
+                            else:
+                                break
+                        
+                        # Envoyer le contenu accumulé s'il n'est pas dans un bloc think
+                        if not in_think_block and buffer and "<think>" not in buffer:
+                            response_text += buffer
+                            filtered_text_for_tts += buffer  # Ajouter au texte filtré
+                            response_placeholder.markdown(response_text)
+                            buffer = ""
+                    else:
+                        # Si l'affichage du processus de réflexion est activé
+                        # Ajouter au processus de réflexion complet
+                        thinking_process += content
+                        
+                        # Traiter le contenu pour filtrer les balises <think> même si show_thinking est activé
+                        # pour l'affichage dans la réponse principale
+                        if "<think>" in content or "</think>" in content or in_think_block:
+                            # Si le contenu contient <think> ou est dans un bloc think
+                            if "<think>" in content:
                                 parts = content.split("<think>", 1)
                                 if parts[0]:
+                                    response_text += parts[0]
                                     filtered_text_for_tts += parts[0]
                                 in_think_block = True
+                                if len(parts) > 1:
+                                    # Traiter le reste après <think>
+                                    remaining = parts[1]
+                                    if "</think>" in remaining:
+                                        think_parts = remaining.split("</think>", 1)
+                                        in_think_block = False
+                                        if len(think_parts) > 1 and think_parts[1]:
+                                            response_text += think_parts[1]
+                                            filtered_text_for_tts += think_parts[1]
                             elif "</think>" in content and in_think_block:
                                 parts = content.split("</think>", 1)
-                                if len(parts) > 1:
-                                    filtered_text_for_tts += parts[1]
                                 in_think_block = False
-                                
-                            response_placeholder.markdown(response_text)
-                    else:
-                        # Traiter tout contenu restant
-                        if buffer and not in_think_block and not show_thinking:
-                            response_text += buffer
-                            filtered_text_for_tts += buffer
-                            response_placeholder.markdown(response_text)
+                                if len(parts) > 1 and parts[1]:
+                                    response_text += parts[1]
+                                    filtered_text_for_tts += parts[1]
+                        else:
+                            # Si le contenu ne contient pas de balises think
+                            response_text += content
+                            filtered_text_for_tts += content
+                            
+                        response_placeholder.markdown(response_text)
+                else:
+                    # Traiter tout contenu restant
+                    if buffer and not in_think_block and not show_thinking:
+                        response_text += buffer
+                        filtered_text_for_tts += buffer
+                        response_placeholder.markdown(response_text)
+                    
+                    # Sauvegarder le thinking process pour affichage ultérieur
+                    st.session_state.last_thinking_data = thinking_process
+                    
+                    # Ajouter à l'historique de conversation
+                    st.session_state.conversation_history.append((user_input, filtered_text_for_tts))
+                    
+                    # Générer et afficher l'audio si activé
+                    if enable_tts and filtered_text_for_tts:
+                        audio_bytes = text_to_speech(filtered_text_for_tts)
+                        if audio_bytes:
+                            audio_placeholder.markdown(create_audio_player_html(audio_bytes), unsafe_allow_html=True)
+                            # Sauvegarder l'audio pour affichage ultérieur
+                            st.session_state.last_audio_data = audio_bytes
+                    
+                    # Afficher les expanders immédiatement après avoir terminé la génération
+                    if show_thinking:
+                        if st.session_state.last_results is not None:
+                            with st.expander("Voir les documents récupérés", expanded=False):
+                                st.write(st.session_state.last_results)
                         
-                        # Générer et afficher l'audio si activé
-                        if enable_tts and filtered_text_for_tts:
-                            audio_bytes = text_to_speech(filtered_text_for_tts)
-                            if audio_bytes:
-                                audio_placeholder.markdown(create_audio_player_html(audio_bytes), unsafe_allow_html=True)
+                        if st.session_state.last_relevant_ids is not None and st.session_state.last_relevant_text is not None:
+                            with st.expander("Voir les documents les plus pertinents", expanded=False):
+                                st.write(st.session_state.last_relevant_ids)
+                                st.write(st.session_state.last_relevant_text)
                         
-                        # Enregistrer et afficher le temps total final
-                        break
+                        if st.session_state.last_thinking_data is not None:
+                            with st.expander("Voir le processus de réflexion du modèle", expanded=False):
+                                st.write(st.session_state.last_thinking_data)
+                    
+                    # Enregistrer et afficher le temps total final
+                    break
             
             # Mise à jour finale du chronomètre
             total_time = time.time() - start_time
             timer_container.markdown(f"⏱️ **{total_time:.1f}s**")
             st.session_state.total_time = total_time
+    else:
+        # Afficher les expanders même si aucune nouvelle question n'est posée
+        if show_thinking:
+            if st.session_state.last_results is not None:
+                with st.expander("Voir les documents récupérés", expanded=False):
+                    st.write(st.session_state.last_results)
             
-            # Afficher les détails supplémentaires uniquement si show_thinking est activé
-            if show_thinking:
-                with st.expander("See retrieved documents"):
-                    st.write(results)
-
-                with st.expander("See most relevant document ids"):
-                    st.write(relevant_text_ids)
-                    st.write(relevant_text)
+            if st.session_state.last_relevant_ids is not None and st.session_state.last_relevant_text is not None:
+                with st.expander("Voir les documents les plus pertinents", expanded=False):
+                    st.write(st.session_state.last_relevant_ids)
+                    st.write(st.session_state.last_relevant_text)
+            
+            if st.session_state.last_thinking_data is not None:
+                with st.expander("Voir le processus de réflexion du modèle", expanded=False):
+                    st.write(st.session_state.last_thinking_data)
