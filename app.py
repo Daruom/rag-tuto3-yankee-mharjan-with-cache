@@ -3,8 +3,9 @@ import os
 import sys
 import tempfile
 import time
+import base64
 from datetime import datetime
-from io import StringIO
+from io import StringIO, BytesIO
 
 import chromadb
 import ollama
@@ -19,6 +20,10 @@ from langchain_redis import RedisConfig, RedisVectorStore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import CrossEncoder
 from streamlit.runtime.uploaded_file_manager import UploadedFile
+
+# Imports pour Kokoro TTS
+from kokoro import KPipeline
+import soundfile as sf
 
 system_prompt = """You are an well-being coach expert in question-answering tasks with a human-likedirect style. 
 
@@ -372,6 +377,73 @@ def re_rank_cross_encoders(documents: list[str], show_thinking: bool = False) ->
     return relevant_text, relevant_text_ids
 
 
+def text_to_speech(text, voice="af_heart"):
+    """
+    Convertit du texte en audio avec Kokoro TTS.
+    
+    Args:
+        text: Le texte à convertir en audio
+        voice: La voix à utiliser pour la synthèse
+    
+    Returns:
+        bytes: Les données audio en format wav
+    """
+    if not text.strip():
+        return None
+    
+    # Nettoyer le texte avant de le passer à Kokoro
+    # En supprimant les balises <think> si présentes
+    text = text.replace("<think>", "").replace("</think>", "")
+    
+    # Initialiser le pipeline Kokoro
+    pipeline = KPipeline(lang_code='a')
+    
+    # Créer un BytesIO pour stocker les données audio
+    audio_data = BytesIO()
+    
+    # Générer l'audio
+    try:
+        generator = pipeline(text, voice=voice)
+        for i, (gs, ps, audio) in enumerate(generator):
+            # Prendre seulement le premier segment audio généré
+            if i == 0:
+                # Écrire les données audio dans le buffer
+                sf.write(audio_data, audio, 24000, format='WAV')
+                break
+        
+        # Réinitialiser le pointeur au début du buffer
+        audio_data.seek(0)
+        return audio_data.read()
+    except Exception as e:
+        st.error(f"Erreur lors de la génération audio: {str(e)}")
+        return None
+
+def create_audio_player_html(audio_bytes):
+    """
+    Crée un élément audio HTML à partir des données audio.
+    
+    Args:
+        audio_bytes: Les données audio en bytes
+    
+    Returns:
+        str: Le HTML de l'élément audio
+    """
+    if audio_bytes is None:
+        return ""
+        
+    # Encoder les données audio en base64
+    b64 = base64.b64encode(audio_bytes).decode()
+    
+    # Créer un élément audio HTML
+    html = f"""
+    <audio controls autoplay style="width: 100%;">
+        <source src="data:audio/wav;base64,{b64}" type="audio/wav">
+        Votre navigateur ne supporte pas l'élément audio.
+    </audio>
+    """
+    return html
+
+
 if __name__ == "__main__":
     # Initialiser les variables de session pour le chronomètre
     if 'total_time' not in st.session_state:
@@ -418,8 +490,8 @@ if __name__ == "__main__":
     st.header("🗣️ RAG Question Answer")
     prompt = st.text_area("**Ask a question related to your document:**")
     
-    # Nouvelle interface avec bouton plus petit et zone pour le chronomètre
-    cols = st.columns([2, 1, 1])
+    # Nouvelle interface avec bouton plus petit et zone pour le chronomètre et TTS
+    cols = st.columns([2, 1, 1, 1])
     with cols[0]:
         ask = st.button("🔥 Ask", use_container_width=False)
     with cols[1]:
@@ -427,6 +499,10 @@ if __name__ == "__main__":
                                   help="Montre ou cache le processus de réflexion du modèle (balises <think>)", 
                                   key="show_thinking_checkbox")
     with cols[2]:
+        enable_tts = st.checkbox("🔊 Audio TTS", value=False,
+                               help="Activer la lecture audio de la réponse",
+                               key="enable_tts_checkbox")
+    with cols[3]:
         # Afficher le chronomètre s'il y a un temps total
         if st.session_state.total_time > 0:
             st.metric("⏱️", f"{st.session_state.total_time:.1f}s")
@@ -455,7 +531,15 @@ if __name__ == "__main__":
 
         if cached_results:
             # Afficher les résultats du cache
-            st.write(cached_results[0][0].metadata["answer"].replace("\\n", "\n"))
+            response_text = cached_results[0][0].metadata["answer"].replace("\\n", "\n")
+            st.write(response_text)
+            
+            # Générer et afficher l'audio si activé
+            if enable_tts:
+                audio_bytes = text_to_speech(response_text)
+                if audio_bytes:
+                    st.markdown(create_audio_player_html(audio_bytes), unsafe_allow_html=True)
+            
             # Mise à jour finale du chrono pour les résultats du cache
             total_time = time.time() - start_time
             timer_container.markdown(f"⏱️ **{total_time:.1f}s**")
@@ -489,6 +573,9 @@ if __name__ == "__main__":
                 # Placeholder pour la réponse
                 response_placeholder = st.empty()
                 
+                # Container pour l'audio
+                audio_placeholder = st.empty()
+                
                 # Générer et afficher la réponse
                 response_text = ""
                 
@@ -512,6 +599,9 @@ if __name__ == "__main__":
                 buffer = ""
                 in_think_block = False
                 
+                # Pour stocker le texte filtré pour TTS (sans balises think)
+                filtered_text_for_tts = ""
+                
                 for chunk in response:
                     # Mettre à jour le chrono à chaque chunk
                     update_timer()
@@ -529,6 +619,7 @@ if __name__ == "__main__":
                                     parts = buffer.split("<think>", 1)
                                     if parts[0]:
                                         response_text += parts[0]
+                                        filtered_text_for_tts += parts[0]  # Ajouter au texte filtré
                                         response_placeholder.markdown(response_text)
                                     buffer = parts[1]
                                     in_think_block = True
@@ -547,17 +638,39 @@ if __name__ == "__main__":
                             # Envoyer le contenu accumulé s'il n'est pas dans un bloc think
                             if not in_think_block and buffer and "<think>" not in buffer:
                                 response_text += buffer
+                                filtered_text_for_tts += buffer  # Ajouter au texte filtré
                                 response_placeholder.markdown(response_text)
                                 buffer = ""
                         else:
                             # Si l'affichage du processus de réflexion est activé, envoyer tel quel
                             response_text += content
+                            # Mais ne pas ajouter les blocs think au texte pour TTS
+                            if "<think>" not in content and "</think>" not in content and not in_think_block:
+                                filtered_text_for_tts += content
+                            elif "<think>" in content:
+                                parts = content.split("<think>", 1)
+                                if parts[0]:
+                                    filtered_text_for_tts += parts[0]
+                                in_think_block = True
+                            elif "</think>" in content and in_think_block:
+                                parts = content.split("</think>", 1)
+                                if len(parts) > 1:
+                                    filtered_text_for_tts += parts[1]
+                                in_think_block = False
+                                
                             response_placeholder.markdown(response_text)
                     else:
                         # Traiter tout contenu restant
                         if buffer and not in_think_block and not show_thinking:
                             response_text += buffer
+                            filtered_text_for_tts += buffer
                             response_placeholder.markdown(response_text)
+                        
+                        # Générer et afficher l'audio si activé
+                        if enable_tts and filtered_text_for_tts:
+                            audio_bytes = text_to_speech(filtered_text_for_tts)
+                            if audio_bytes:
+                                audio_placeholder.markdown(create_audio_player_html(audio_bytes), unsafe_allow_html=True)
                         
                         # Enregistrer et afficher le temps total final
                         break
