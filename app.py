@@ -500,6 +500,8 @@ if __name__ == "__main__":
         st.session_state.submit_clicked = False
     if 'input_key' not in st.session_state:
         st.session_state.input_key = 0
+    if 'last_full_context' not in st.session_state:
+        st.session_state.last_full_context = None
     
     # Document Upload Area
     with st.sidebar:
@@ -717,6 +719,13 @@ if __name__ == "__main__":
                 ],
             )
             
+            # Sauvegarder le contexte complet
+            st.session_state.last_full_context = system_prompt.format(
+                context=relevant_text, 
+                conversation_history=format_conversation_history(st.session_state.conversation_history),
+                question=user_input
+            )
+            
             # Pour le traitement des balises <think>
             buffer = ""
             in_think_block = False
@@ -838,6 +847,10 @@ if __name__ == "__main__":
                         if st.session_state.last_thinking_data is not None:
                             with st.expander("Voir le processus de réflexion du modèle", expanded=False):
                                 st.write(st.session_state.last_thinking_data)
+                                
+                        if st.session_state.last_full_context is not None:
+                            with st.expander("Voir le contexte total du modèle", expanded=False):
+                                st.code(st.session_state.last_full_context, language="text")
                     
                     # Enregistrer et afficher le temps total final
                     break
@@ -861,3 +874,7 @@ if __name__ == "__main__":
             if st.session_state.last_thinking_data is not None:
                 with st.expander("Voir le processus de réflexion du modèle", expanded=False):
                     st.write(st.session_state.last_thinking_data)
+                    
+            if st.session_state.last_full_context is not None:
+                with st.expander("Voir le contexte total du modèle", expanded=False):
+                    st.code(st.session_state.last_full_context, language="text")
