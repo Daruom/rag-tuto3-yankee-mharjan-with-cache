@@ -59,6 +59,10 @@ Answer:"""
 if 'conversation_history' not in st.session_state:
     st.session_state.conversation_history = []
 
+# Initialisation du niveau de conversation
+if 'conversation_level' not in st.session_state:
+    st.session_state.conversation_level = 0
+
 def get_redis_store() -> RedisVectorStore:
     """Gets or creates a Redis vector store for caching embeddings.
 
@@ -233,7 +237,7 @@ def add_to_vector_collection(all_splits: list[Document], file_name: str):
     st.success("Data added to the vector store!")
 
 
-def query_collection(prompt: str, n_results: int = 20):
+def query_collection(prompt: str, n_results: int = 10):
     """Queries the vector collection with a given prompt to retrieve relevant documents.
 
     Args:
@@ -268,6 +272,163 @@ def format_conversation_history(history):
         formatted_history += f"User: {question}\nAssistant: {answer}\n\n"
     
     return formatted_history
+
+
+def get_adaptive_prompt(conversation_level):
+    """Adapte le prompt système en fonction du niveau de conversation.
+    
+    Args:
+        conversation_level: Niveau actuel de la conversation
+        
+    Returns:
+        str: Prompt système adapté
+    """
+    base_prompt = system_prompt
+    
+    if conversation_level == 1:
+        return base_prompt + "\nComme c'est notre première interaction, n'hésitez pas à donner un contexte général."
+    elif conversation_level <= 3:
+        return base_prompt + "\nPrenez en compte nos échanges précédents pour approfondir votre réponse."
+    else:
+        return base_prompt + "\nNous avons déjà échangé plusieurs fois sur ce sujet. Concentrez-vous sur les nuances."
+
+
+def get_adapted_context(user_input, conversation_level, conversation_history, show_thinking=False):
+    """Adapte le contexte en fonction du niveau de conversation.
+    
+    Args:
+        user_input: Question actuelle de l'utilisateur
+        conversation_level: Niveau actuel de la conversation
+        conversation_history: Historique des conversations
+        show_thinking: Si True, affiche des logs sur le processus
+        
+    Returns:
+        tuple: Contexte adapté (texte pertinent et IDs)
+    """
+    # Récupération du contexte standard
+    st.session_state.query_prompt = user_input  # Sauvegarder le prompt standard
+    
+    if show_thinking:
+        st.write(f"🔄 **Niveau de conversation actuel: {conversation_level}**")
+        st.write(f"🔍 **Requête initiale**: '{user_input}'")
+    
+    results = query_collection(prompt=user_input)
+    
+    # Sauvegarder pour l'affichage ultérieur dans les expanders
+    st.session_state.last_results = results
+    st.session_state.initial_results = results  # Stocker séparément les résultats initiaux
+    
+    context = results.get("documents")[0]
+    
+    if show_thinking:
+        st.write(f"📊 **Nombre de documents trouvés par recherche initiale: {len(context)}**")
+    
+    # Premier niveau: contexte RAG standard (comme actuellement)
+    if conversation_level <= 1:
+        if show_thinking:
+            st.write("📝 **Utilisation du contexte RAG standard (niveau 1)**")
+            st.write("📄 **Extraits des premiers documents trouvés:**")
+            for i, doc in enumerate(context[:3]):
+                st.write(f"Document {i+1}: {doc[:200]}...")
+                
+        relevant_text, relevant_text_ids = re_rank_cross_encoders(context, show_thinking)
+        
+        # Sauvegarder le type de stratégie utilisé
+        st.session_state.context_strategy = "Recherche standard (niveau 1)"
+        st.session_state.context_stats = f"{len(relevant_text_ids)} documents pertinents sur {len(context)} documents trouvés"
+        
+        return relevant_text, relevant_text_ids
+    
+    # Niveaux 2-3: enrichissement avec l'historique récent
+    elif conversation_level <= 3:
+        if show_thinking:
+            st.write("📝 **Enrichissement du contexte avec l'historique récent (niveaux 2-3)**")
+        
+        # Créer une requête composite avec les questions précédentes
+        composite_query = user_input
+        
+        # Modifier la condition pour inclure les questions précédentes même s'il n'y a qu'un seul échange
+        if len(conversation_history) > 0:
+            # Prendre toutes les questions précédentes (max 2)
+            recent_questions = " ".join([q for q, _ in conversation_history[-2:]])
+            composite_query += " " + recent_questions
+            
+            if show_thinking:
+                st.write(f"🔍 **Requête composite**: '{composite_query}'")
+                st.write(f"📊 **Questions incluses de l'historique**: {len(conversation_history[-2:])} question(s)")
+        
+        # Sauvegarder le prompt composite
+        st.session_state.query_prompt = composite_query
+        
+        # Rechercher des documents supplémentaires avec cette requête enrichie
+        supplementary_results = query_collection(prompt=composite_query)
+        supplementary_context = supplementary_results.get("documents")[0]
+        
+        # Stocker les résultats supplémentaires pour un affichage séparé
+        st.session_state.supplementary_results = supplementary_results
+        
+        if show_thinking:
+            st.write(f"📚 **Documents supplémentaires trouvés**: {len(supplementary_context)}")
+            st.write("📄 **Extraits des documents supplémentaires:**")
+            for i, doc in enumerate(supplementary_context[:2]):
+                st.write(f"Document supplémentaire {i+1}: {doc[:150]}...")
+            
+        combined_context = context + supplementary_context
+        
+        # Reranker ce contexte combiné
+        if show_thinking:
+            st.write(f"🔄 **Reranking d'un contexte combiné de {len(combined_context)} documents**")
+        
+        relevant_text, relevant_text_ids = re_rank_cross_encoders(combined_context, show_thinking)
+        
+        # Sauvegarder le type de stratégie utilisé
+        st.session_state.context_strategy = "Requête enrichie avec historique (niveaux 2-3)"
+        st.session_state.context_stats = f"{len(relevant_text_ids)} documents pertinents sur {len(combined_context)} documents combinés"
+        
+        return relevant_text, relevant_text_ids
+    
+    # Niveau 4+: contexte plus ciblé sur la continuité
+    else:
+        if show_thinking:
+            st.write("📝 **Utilisation d'un contexte ciblé sur la continuité (niveau 4+)**")
+            
+        # Créer une requête pondérée avec les 3 dernières questions et réponses
+        weighted_query = user_input
+        if len(conversation_history) >= 3:
+            recent_exchanges = " ".join([q + " " + a for q, a in conversation_history[-3:]])
+            weighted_query = f"{user_input} {recent_exchanges}"
+            
+            if show_thinking:
+                st.write(f"🔍 **Requête pondérée avec Q&R récentes**: '{weighted_query[:100]}...'")
+                st.write(f"📊 **Échanges inclus de l'historique**: {min(len(conversation_history), 3)} échanges complets")
+        
+        # Sauvegarder le prompt pondéré
+        st.session_state.query_prompt = weighted_query
+        
+        # Rechercher des documents plus ciblés
+        focused_results = query_collection(prompt=weighted_query, n_results=20)
+        focused_context = focused_results.get("documents")[0]
+        
+        # Stocker les résultats ciblés pour un affichage séparé
+        st.session_state.focused_results = focused_results
+        
+        if show_thinking:
+            st.write(f"📚 **Documents ciblés trouvés**: {len(focused_context)}")
+            st.write("📄 **Extraits des documents ciblés:**")
+            for i, doc in enumerate(focused_context[:3]):
+                st.write(f"Document ciblé {i+1}: {doc[:150]}...")
+        
+        # Reranker avec moins de documents pour plus de précision
+        if show_thinking:
+            st.write("🔄 **Reranking avec focus sur la pertinence**")
+        
+        relevant_text, relevant_text_ids = re_rank_cross_encoders(focused_context, show_thinking)
+        
+        # Sauvegarder le type de stratégie utilisé
+        st.session_state.context_strategy = "Contexte ciblé avec conversation complète (niveau 4+)"
+        st.session_state.context_stats = f"{len(relevant_text_ids)} documents pertinents sur {len(focused_context)} documents ciblés"
+        
+        return relevant_text, relevant_text_ids
 
 
 def call_llm(context: str, prompt: str, conversation_history=None, show_thinking: bool = False, timer_placeholder=None):
@@ -391,10 +552,12 @@ def re_rank_cross_encoders(documents: list[str], show_thinking: bool = False) ->
     relevant_text_ids = []
 
     encoder_model = CrossEncoder("BAAI/bge-reranker-v2-m3")
-    ranks = encoder_model.rank(prompt, documents, top_k=10)
+    # Utiliser le prompt stocké dans session_state plutôt que la variable 'prompt' indéfinie
+    ranks = encoder_model.rank(st.session_state.query_prompt, documents, top_k=5)
     
     # Afficher les détails du reranking uniquement si show_thinking est activé
     if show_thinking:
+        st.write("🔄 **Résultats du reranking:**")
         st.write(ranks)
     
     for rank in ranks:
@@ -403,6 +566,7 @@ def re_rank_cross_encoders(documents: list[str], show_thinking: bool = False) ->
     
     # Afficher le texte pertinent uniquement si show_thinking est activé
     if show_thinking:
+        st.write("📄 **Texte pertinent assemblé:**")
         st.write(relevant_text)
         st.divider()
         
@@ -485,6 +649,26 @@ if __name__ == "__main__":
     if 'conversation_history' not in st.session_state:
         st.session_state.conversation_history = []
     
+    # Initialiser le niveau de conversation s'il n'existe pas
+    if 'conversation_level' not in st.session_state:
+        st.session_state.conversation_level = 0
+    
+    # Initialiser les statistiques de contexte
+    if 'context_strategy' not in st.session_state:
+        st.session_state.context_strategy = ""
+    if 'context_stats' not in st.session_state:
+        st.session_state.context_stats = ""
+    if 'query_prompt' not in st.session_state:
+        st.session_state.query_prompt = ""
+        
+    # Initialiser les variables pour les résultats des différentes stratégies
+    if 'initial_results' not in st.session_state:
+        st.session_state.initial_results = None
+    if 'supplementary_results' not in st.session_state:
+        st.session_state.supplementary_results = None
+    if 'focused_results' not in st.session_state:
+        st.session_state.focused_results = None
+        
     # Initialiser les variables pour conserver les données entre les recharges
     if 'last_thinking_data' not in st.session_state:
         st.session_state.last_thinking_data = None
@@ -543,6 +727,7 @@ if __name__ == "__main__":
         # Bouton pour réinitialiser la conversation
         if st.button("🔄 Nouvelle conversation"):
             st.session_state.conversation_history = []
+            st.session_state.conversation_level = 0
             st.session_state.last_thinking_data = None
             st.session_state.last_relevant_ids = None
             st.session_state.last_relevant_text = None
@@ -614,6 +799,9 @@ if __name__ == "__main__":
         # Réinitialiser le temps total
         st.session_state.total_time = 0
         
+        # Incrémenter le niveau de conversation
+        st.session_state.conversation_level += 1
+        
         # Container pour le chronomètre en temps réel
         timer_container = st.empty()
         timer_container.markdown("⏱️ **0.0s**")
@@ -631,6 +819,10 @@ if __name__ == "__main__":
         # Afficher la question de l'utilisateur immédiatement
         st.markdown(f"**Vous**: {user_input}")
         
+        # Afficher des informations sur le niveau de conversation si show_thinking est activé
+        if show_thinking:
+            st.info(f"Niveau de conversation: {st.session_state.conversation_level} | Historique: {len(st.session_state.conversation_history)} échanges")
+
         cached_results = query_semantic_cache(query=user_input)
 
         if cached_results:
@@ -655,31 +847,38 @@ if __name__ == "__main__":
         else:
             # Mettre à jour le chronomètre avant chaque étape
             update_timer()
-            results = query_collection(prompt=user_input)
-            # Sauvegarder pour l'affichage ultérieur
-            st.session_state.last_results = results
             
-            # Mettre à jour à nouveau
+            # Utiliser le contexte adapté au niveau de conversation
+            relevant_text, relevant_text_ids = get_adapted_context(
+                user_input, 
+                st.session_state.conversation_level,
+                st.session_state.conversation_history,
+                show_thinking
+            )
+            
+            # Mettre à jour le chronomètre
             update_timer()
-            
-            context = results.get("documents")[0]
-            
-            if not context:
-                st.write("No results found.")
-                sys.exit(1)
-
-            # Mettre à jour à nouveau
-            update_timer()
-            
-            # Collecter les données de réflexion si show_thinking est activé
-            thinking_data = []
-            
-            # Passer le paramètre show_thinking à la fonction re_rank_cross_encoders
-            relevant_text, relevant_text_ids = re_rank_cross_encoders(context, show_thinking=False)
             
             # Sauvegarder pour l'affichage ultérieur
             st.session_state.last_relevant_text = relevant_text
             st.session_state.last_relevant_ids = relevant_text_ids
+            
+            # Afficher des statistiques de contexte (visible même sans show_thinking)
+            with st.expander(f"ℹ️ Contexte utilisé - {st.session_state.context_strategy}", expanded=False):
+                st.markdown(f"**Niveau de conversation**: {st.session_state.conversation_level}")
+                st.markdown(f"**Statistiques**: {st.session_state.context_stats}")
+                st.markdown(f"**Taille du contexte**: ~{len(relevant_text)} caractères")
+                st.markdown(f"**Prompt de recherche utilisé**:")
+                st.code(st.session_state.query_prompt)
+                st.markdown("**Extraits de contexte utilisés:**")
+                # Afficher quelques extraits du contexte
+                chunks = relevant_text.split()
+                if len(chunks) > 30:
+                    st.markdown(f"*Début*: {' '.join(chunks[:30])}...")
+                    st.markdown(f"*Milieu*: ...{' '.join(chunks[len(chunks)//2-15:len(chunks)//2+15])}...")
+                    st.markdown(f"*Fin*: ...{' '.join(chunks[-30:])}")
+                else:
+                    st.markdown(relevant_text)
             
             # Mettre à jour à nouveau
             update_timer()
@@ -699,6 +898,19 @@ if __name__ == "__main__":
             # Pour collecter le thinking process
             thinking_process = ""
             
+            # Obtenir le prompt adapté au niveau de conversation
+            adaptive_prompt = get_adaptive_prompt(st.session_state.conversation_level)
+            
+            # Afficher des informations sur le prompt adapté si show_thinking est activé
+            if show_thinking:
+                st.write("🔄 **Adaptation du prompt système:**")
+                if st.session_state.conversation_level == 1:
+                    st.write("📝 Prompt pour première interaction - contexte général")
+                elif st.session_state.conversation_level <= 3:
+                    st.write("📝 Prompt pour interaction intermédiaire - approfondissement")
+                else:
+                    st.write("📝 Prompt pour conversation avancée - focus sur les nuances")
+
             # Utiliser directement ollama.chat pour plus de contrôle
             response = ollama.chat(
                 model="deepseek-r1:8b-llama-distill-q4_K_M",
@@ -706,7 +918,7 @@ if __name__ == "__main__":
                 messages=[
                     {
                         "role": "system",
-                        "content": system_prompt.format(
+                        "content": adaptive_prompt.format(
                             context=relevant_text, 
                             conversation_history=format_conversation_history(st.session_state.conversation_history),
                             question=user_input
@@ -719,8 +931,8 @@ if __name__ == "__main__":
                 ],
             )
             
-            # Sauvegarder le contexte complet
-            st.session_state.last_full_context = system_prompt.format(
+            # Sauvegarder le contexte complet avec le prompt adapté
+            st.session_state.last_full_context = adaptive_prompt.format(
                 context=relevant_text, 
                 conversation_history=format_conversation_history(st.session_state.conversation_history),
                 question=user_input
@@ -835,13 +1047,37 @@ if __name__ == "__main__":
                     
                     # Afficher les expanders immédiatement après avoir terminé la génération
                     if show_thinking:
-                        if st.session_state.last_results is not None:
-                            with st.expander("Voir les documents récupérés", expanded=False):
-                                st.write(st.session_state.last_results)
+                        with st.expander(f"🔍 Stratégie de contexte - Niveau {st.session_state.conversation_level}", expanded=False):
+                            st.markdown(f"**Stratégie utilisée**: {st.session_state.context_strategy}")
+                            st.markdown(f"**Statistiques**: {st.session_state.context_stats}")
+                            st.markdown(f"**Nombre d'échanges dans l'historique**: {len(st.session_state.conversation_history)}")
+                            st.markdown(f"**Prompt de recherche utilisé**:")
+                            st.code(st.session_state.query_prompt)
+                        
+                        # Afficher les résultats selon la stratégie utilisée
+                        if st.session_state.conversation_level <= 1:
+                            # Niveau 1: Afficher les résultats initiaux
+                            if st.session_state.last_results is not None:
+                                with st.expander("Voir les documents récupérés (stratégie standard)", expanded=False):
+                                    st.write(st.session_state.last_results)
+                        elif st.session_state.conversation_level <= 3:
+                            # Niveaux 2-3: Afficher les résultats initiaux et supplémentaires
+                            if st.session_state.initial_results is not None:
+                                with st.expander("Voir les documents de la requête initiale", expanded=False):
+                                    st.write(st.session_state.initial_results)
+                            if st.session_state.supplementary_results is not None:
+                                with st.expander("Voir les documents de la requête enrichie", expanded=False):
+                                    st.write(st.session_state.supplementary_results)
+                        else:
+                            # Niveau 4+: Afficher les résultats ciblés
+                            if st.session_state.focused_results is not None:
+                                with st.expander("Voir les documents de la requête ciblée", expanded=False):
+                                    st.write(st.session_state.focused_results)
                         
                         if st.session_state.last_relevant_ids is not None and st.session_state.last_relevant_text is not None:
-                            with st.expander("Voir les documents les plus pertinents", expanded=False):
-                                st.write(st.session_state.last_relevant_ids)
+                            with st.expander("Voir les documents les plus pertinents après reranking", expanded=False):
+                                st.markdown(f"**IDs des documents sélectionnés**: {st.session_state.last_relevant_ids}")
+                                st.markdown("**Texte complet après assemblage:**")
                                 st.write(st.session_state.last_relevant_text)
                         
                         if st.session_state.last_thinking_data is not None:
@@ -862,13 +1098,34 @@ if __name__ == "__main__":
     else:
         # Afficher les expanders même si aucune nouvelle question n'est posée
         if show_thinking:
-            if st.session_state.last_results is not None:
-                with st.expander("Voir les documents récupérés", expanded=False):
-                    st.write(st.session_state.last_results)
+            with st.expander(f"🔍 Stratégie de contexte - Niveau {st.session_state.conversation_level}", expanded=False):
+                st.markdown(f"**Stratégie utilisée**: {st.session_state.context_strategy}")
+                st.markdown(f"**Statistiques**: {st.session_state.context_stats}")
+                st.markdown(f"**Nombre d'échanges dans l'historique**: {len(st.session_state.conversation_history)}")
+                st.markdown(f"**Prompt de recherche utilisé**:")
+                st.code(st.session_state.query_prompt)
+            
+            # Afficher les résultats selon la stratégie utilisée (même logique que ci-dessus)
+            if st.session_state.conversation_level <= 1:
+                if st.session_state.last_results is not None:
+                    with st.expander("Voir les documents récupérés (stratégie standard)", expanded=False):
+                        st.write(st.session_state.last_results)
+            elif st.session_state.conversation_level <= 3:
+                if st.session_state.initial_results is not None:
+                    with st.expander("Voir les documents de la requête initiale", expanded=False):
+                        st.write(st.session_state.initial_results)
+                if st.session_state.supplementary_results is not None:
+                    with st.expander("Voir les documents de la requête enrichie", expanded=False):
+                        st.write(st.session_state.supplementary_results)
+            else:
+                if st.session_state.focused_results is not None:
+                    with st.expander("Voir les documents de la requête ciblée", expanded=False):
+                        st.write(st.session_state.focused_results)
             
             if st.session_state.last_relevant_ids is not None and st.session_state.last_relevant_text is not None:
-                with st.expander("Voir les documents les plus pertinents", expanded=False):
-                    st.write(st.session_state.last_relevant_ids)
+                with st.expander("Voir les documents les plus pertinents après reranking", expanded=False):
+                    st.markdown(f"**IDs des documents sélectionnés**: {st.session_state.last_relevant_ids}")
+                    st.markdown("**Texte complet après assemblage:**")
                     st.write(st.session_state.last_relevant_text)
             
             if st.session_state.last_thinking_data is not None:
